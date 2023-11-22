@@ -31,7 +31,26 @@ struct test_data {
     unsigned long long samples[MAX_SAMPLES];
     size_t num_samples;
     struct stopwatch_stats expected_stats;
+    void (*iter)(struct test_data *d);
 };
+
+static void
+test_data_start_stop_iter(struct test_data *d)
+{
+    for (size_t j = 0; j < d->num_samples - 1; j ++) {
+        stopwatch_start(d->name, d->samples[j]);
+        stopwatch_stop(d->name, d->samples[j + 1]);
+    }
+}
+
+static void
+test_data_sample_iter(struct  test_data *d)
+{
+    for (size_t j = 0; j < d->num_samples - 1; j ++) {
+        unsigned long long sample =  d->samples[j + 1] - d->samples[j];
+        stopwatch_add_sample(d->name, sample);
+    }
+}
 
 static struct test_data data_sets[] = {
     {
@@ -47,6 +66,7 @@ static struct test_data data_sets[] = {
             .ewma_50 = 0,
             .ewma_1 = 0,
         },
+        .iter = test_data_start_stop_iter,
     },
     {
         .name = "1-interval-unit-length",
@@ -61,6 +81,7 @@ static struct test_data data_sets[] = {
             .ewma_50 = 1,
             .ewma_1 = 1,
         },
+        .iter = test_data_start_stop_iter,
     },
     {
         .name = "10-intervals-unit-length",
@@ -75,6 +96,7 @@ static struct test_data data_sets[] = {
             .ewma_50 = 1,
             .ewma_1 = 1,
         },
+        .iter = test_data_start_stop_iter,
     },
     {
         .name = "10-intervals-linear-growth",
@@ -89,6 +111,7 @@ static struct test_data data_sets[] = {
             .ewma_50 = 9.0,
             .ewma_1 = 1.4,
         },
+        .iter = test_data_start_stop_iter,
     },
     {
         .name = "60-intervals-unit-length",
@@ -109,6 +132,7 @@ static struct test_data data_sets[] = {
             .ewma_50 = 1,
             .ewma_1 = 1,
         },
+        .iter = test_data_start_stop_iter,
     },
     {
         .name = "60-intervals-linear-growth",
@@ -131,6 +155,28 @@ static struct test_data data_sets[] = {
             .ewma_50 = 59,
             .ewma_1 = 15.7,
         },
+        .iter = test_data_start_stop_iter
+    },
+    {
+            .name = "60-intervals-unit-length-sample",
+            .samples = { 1,  2,  3,  4,  5,  6,  7,  8,  9, 10,
+                         11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                         31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+                         41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+                         51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+                         61, },
+            .num_samples = 61,
+            .expected_stats = {
+                    .count = 60,
+                    .unit = UNIT,
+                    .max = 1,
+                    .min = 1,
+                    .pctl_95 = 1,
+                    .ewma_50 = 1,
+                    .ewma_1 = 1,
+            },
+            .iter = test_data_sample_iter,
     },
 };
 
@@ -171,10 +217,7 @@ test_stopwatch_calculate_stats(void)
         fprintf(stderr, "TEST '%s'\n", d->name);
 
         stopwatch_create(d->name, UNIT);
-        for (size_t j = 0; j < d->num_samples - 1; j ++) {
-            stopwatch_start(d->name, d->samples[j]);
-            stopwatch_stop(d->name, d->samples[j + 1]);
-        }
+        d->iter(d);
         stopwatch_sync();
 
         struct stopwatch_stats stats = { .unit = UNIT };

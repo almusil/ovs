@@ -72,6 +72,7 @@ enum stopwatch_op {
     OP_SYNC,
     OP_RESET,
     OP_SHUTDOWN,
+    OP_ADD_SAMPLE,
 };
 
 struct stopwatch_packet {
@@ -385,6 +386,17 @@ stopwatch_end_sample_protected(const struct stopwatch_packet *pkt)
     sw->sample_in_progress = false;
 }
 
+static void
+stopwatch_add_sample_protected(const struct stopwatch_packet *pkt)
+{
+    struct stopwatch *sw = shash_find_data(&stopwatches, pkt->name);
+    if (!sw) {
+        return;
+    }
+
+    add_sample(sw, pkt->time);
+}
+
 static void reset_stopwatch(struct stopwatch *sw)
 {
     sw->short_term.average = 0;
@@ -446,6 +458,9 @@ stopwatch_thread(void *ign OVS_UNUSED)
                 break;
             case OP_SHUTDOWN:
                 should_exit = true;
+                break;
+            case OP_ADD_SAMPLE:
+                stopwatch_add_sample_protected(pkt);
                 break;
             }
             free(pkt);
@@ -549,4 +564,13 @@ stopwatch_sync(void)
     stopwatch_packet_write(pkt);
     ovs_mutex_cond_wait(&stopwatches_sync, &stopwatches_lock);
     ovs_mutex_unlock(&stopwatches_lock);
+}
+
+void
+stopwatch_add_sample(const char *name, unsigned long long sample)
+{
+    struct stopwatch_packet *pkt = stopwatch_packet_create(OP_ADD_SAMPLE);
+    ovs_strlcpy(pkt->name, name, sizeof  pkt->name);
+    pkt->time = sample;
+    stopwatch_packet_write(pkt);
 }
