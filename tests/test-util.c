@@ -1122,6 +1122,12 @@ test_snprintf(struct ovs_cmdl_context *ctx OVS_UNUSED)
      * temporarily disable the warning. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
+#elif __clang__ && __clang_major__ >= 18
+    /* Clang 18+ warns about the following calls that truncate a string using
+     * snprintf().  We're testing that truncation works properly, so
+     * temporarily disable the warning. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-truncation"
 #endif
     ovs_assert(snprintf(s, 4, "abcde") == 5);
     ovs_assert(!strcmp(s, "abc"));
@@ -1130,6 +1136,8 @@ test_snprintf(struct ovs_cmdl_context *ctx OVS_UNUSED)
     ovs_assert(!strcmp(s, "abcd"));
 #if __GNUC__ >= 7
 #pragma GCC diagnostic pop
+#elif __clang__ && __clang_major__ >= 18
+#pragma clang diagnostic pop
 #endif
 
     ovs_assert(snprintf(s, 6, "abcde") == 5);
