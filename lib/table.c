@@ -29,6 +29,21 @@ struct column {
     char *heading;
 };
 
+/* A resolved reference to a single row, at a specific position in a datum. */
+struct cell_ref {
+    unsigned int index;         /* Zero-based index in the source datum. */
+    bool is_value;              /* Map value rather than key or set member. */
+    char *table_name;           /* Name of the referenced table. */
+    struct table *row;          /* Snapshot of the referenced row. */
+};
+
+/* The collection is allocated only for cells with expanded references. */
+struct cell_refs {
+    struct cell_ref *items;      /* Expanded references in datum order. */
+    size_t n;                   /* Number of expanded references. */
+    size_t allocated;           /* Capacity of 'items'. */
+};
+
 static char *
 cell_to_text(struct cell *cell, const struct table_style *style)
 {
@@ -70,6 +85,17 @@ cell_destroy(struct cell *cell)
 {
     free(cell->text);
     json_destroy(cell->json);
+    struct cell_refs *refs = cell->refs;
+    if (refs) {
+        for (size_t i = 0; i < refs->n; i++) {
+            struct cell_ref *ref = &refs->items[i];
+            free(ref->table_name);
+            table_destroy(ref->row);
+            free(ref->row);
+        }
+        free(refs->items);
+        free(refs);
+    }
 }
 
 /* Initializes 'table' as an empty table.
@@ -211,6 +237,30 @@ table_add_cell(struct table *table)
     return table_cell__(table, y, x);
 }
 
+/* Attaches a resolved reference at 'index' in the cell's OVSDB datum, taking
+ * ownership of the single-row table 'row'.  The original datum is unchanged.
+ * 'is_value' is true for the value side of a map entry. */
+void
+table_cell_add_ref(struct cell *cell, unsigned int index, bool is_value,
+                   const char *table_name, struct table *row)
+{
+    ovs_assert(cell->json && cell->type && row->n_rows == 1);
+    struct cell_refs *refs = cell->refs;
+    if (!refs) {
+        refs = cell->refs = xzalloc(sizeof *refs);
+    }
+    if (refs->n >= refs->allocated) {
+        refs->items = x2nrealloc(refs->items, &refs->allocated,
+                                sizeof *refs->items);
+    }
+    refs->items[refs->n++] = (struct cell_ref) {
+        .index = index,
+        .is_value = is_value,
+        .table_name = xstrdup(table_name),
+        .row = row,
+    };
+}
+
 static void
 table_finish_line(struct ds *s)
 {
@@ -237,6 +287,84 @@ table_print_timestamp__(const struct table *table, struct ds *s)
 }
 
 static bool first_table = true;
+
+static void table_print_list_row__(const struct table *,
+                                   const struct table_style *, size_t row,
+                                   size_t indent, struct ds *);
+
+/* Formats a map key or value from the cell's native JSON datum. */
+static void
+table_print_atom__(const struct json *json, const struct ovsdb_base_type *base,
+                   const struct table_style *style, struct ds *s)
+{
+    if (style->cell_format == CF_STRING) {
+        union ovsdb_atom atom;
+        struct ovsdb_error *error = ovsdb_atom_from_json(&atom, base, json,
+                                                        NULL);
+        if (!error) {
+            ovsdb_atom_to_string(&atom, base->type, s);
+            ovsdb_atom_destroy(&atom, base->type);
+            return;
+        }
+        ovsdb_error_destroy(error);
+    }
+    json_to_ds(json, 0, s);
+}
+
+/* Prints child rows separately from the parent cell's ordinary rendering. */
+static void
+table_print_cell_refs__(const struct cell *cell, const char *heading,
+                        const struct table_style *style, size_t indent,
+                        struct ds *s)
+{
+    const struct cell_refs *refs = cell->refs;
+    if (!refs) {
+        return;
+    }
+
+    for (size_t i = 0; i < refs->n; i++) {
+        const struct cell_ref *ref = &refs->items[i];
+        ds_put_char_multiple(s, ' ', indent);
+        ds_put_format(s, "%s[%u].%s", heading, ref->index,
+                      ref->is_value ? "value" : "key");
+        if (ovsdb_type_is_map(cell->type)) {
+            /* OVSDB maps encode their entries as ["map", [[key, value], ...]].
+             * Use the original entry even if the table grid truncated it. */
+            const struct json *entries = json_array_at(cell->json, 1);
+            const struct json *entry = json_array_at(entries, ref->index);
+            ds_put_cstr(s, " (");
+            table_print_atom__(json_array_at(entry, 0), &cell->type->key,
+                               style, s);
+            ds_put_char(s, '=');
+            table_print_atom__(json_array_at(entry, 1), &cell->type->value,
+                               style, s);
+            ds_put_char(s, ')');
+        }
+        ds_put_format(s, " -> %s:\n", ref->table_name);
+        table_print_list_row__(ref->row, style, 0, indent + 2, s);
+    }
+}
+
+/* Prints one row and its descendants as a list of fields. */
+static void
+table_print_list_row__(const struct table *table,
+                       const struct table_style *style, size_t row,
+                       size_t indent, struct ds *s)
+{
+    for (size_t x = 0; x < table->n_columns; x++) {
+        struct cell *cell = table_cell__(table, row, x);
+        const char *heading = table->columns[x].heading;
+
+        if (indent) {
+            ds_put_char_multiple(s, ' ', indent);
+        }
+        if (style->headings) {
+            ds_put_format(s, "%-20s: ", heading);
+        }
+        ds_put_format(s, "%s\n", cell_to_text(cell, style));
+        table_print_cell_refs__(cell, heading, style, indent + 2, s);
+    }
+}
 
 static void
 table_print_table__(const struct table *table, const struct table_style *style,
@@ -304,14 +432,24 @@ table_print_table__(const struct table *table, const struct table_style *style,
     }
 
     for (y = 0; y < table->n_rows; y++) {
+        bool has_refs = false;
         for (x = 0; x < table->n_columns; x++) {
-            const char *text = cell_to_text(table_cell__(table, y, x), style);
+            struct cell *cell = table_cell__(table, y, x);
+            const char *text = cell_to_text(cell, style);
+            has_refs |= cell->refs != NULL;
             if (x) {
                 ds_put_char(s, ' ');
             }
             ds_put_format(s, "%-*.*s", widths[x], widths[x], text);
         }
         table_finish_line(s);
+        if (has_refs) {
+            for (x = 0; x < table->n_columns; x++) {
+                table_print_cell_refs__(table_cell__(table, y, x),
+                                        table->columns[x].heading, style,
+                                        2, s);
+            }
+        }
     }
 
     free(widths);
@@ -321,8 +459,6 @@ static void
 table_print_list__(const struct table *table, const struct table_style *style,
                    struct ds *s)
 {
-    size_t x, y;
-
     if (first_table) {
         first_table = false;
     } else {
@@ -335,17 +471,11 @@ table_print_list__(const struct table *table, const struct table_style *style,
         ds_put_format(s, "%s\n", table->caption);
     }
 
-    for (y = 0; y < table->n_rows; y++) {
+    for (size_t y = 0; y < table->n_rows; y++) {
         if (y > 0) {
             ds_put_char(s, '\n');
         }
-        for (x = 0; x < table->n_columns; x++) {
-            const char *text = cell_to_text(table_cell__(table, y, x), style);
-            if (style->headings) {
-                ds_put_format(s, "%-20s: ", table->columns[x].heading);
-            }
-            ds_put_format(s, "%s\n", text);
-        }
+        table_print_list_row__(table, style, y, 0, s);
     }
 }
 
@@ -510,6 +640,39 @@ table_print_csv__(const struct table *table, const struct table_style *style,
     }
 }
 
+/* Wraps expanded cells without replacing their native OVSDB datum. */
+static struct json *
+cell_to_json(const struct cell *cell)
+{
+    const struct cell_refs *refs = cell->refs;
+    if (!refs) {
+        if (cell->text) {
+            return json_string_create(cell->text);
+        }
+        return cell->json ? json_clone(cell->json) : json_null_create();
+    }
+
+    struct json *json = json_object_create();
+    json_object_put(json, "value", json_clone(cell->json));
+    struct json *array = json_array_create_empty();
+    for (size_t i = 0; i < refs->n; i++) {
+        const struct cell_ref *ref = &refs->items[i];
+        struct json *entry = json_object_create();
+        json_object_put(entry, "index", json_integer_create(ref->index));
+        json_object_put_string(entry, "side", ref->is_value ? "value" : "key");
+        json_object_put_string(entry, "table", ref->table_name);
+        struct json *row = json_object_create();
+        for (size_t x = 0; x < ref->row->n_columns; x++) {
+            json_object_put(row, ref->row->columns[x].heading,
+                            cell_to_json(table_cell__(ref->row, 0, x)));
+        }
+        json_object_put(entry, "row", row);
+        json_array_add(array, entry);
+    }
+    json_object_put(json, "refs", array);
+    return json;
+}
+
 static void
 table_print_json__(const struct table *table, const struct table_style *style,
                    struct ds *s)
@@ -538,14 +701,7 @@ table_print_json__(const struct table *table, const struct table_style *style,
     for (y = 0; y < table->n_rows; y++) {
         struct json *row = json_array_create_empty();
         for (x = 0; x < table->n_columns; x++) {
-            const struct cell *cell = table_cell__(table, y, x);
-            if (cell->text) {
-                json_array_add(row, json_string_create(cell->text));
-            } else if (cell->json) {
-                json_array_add(row, json_clone(cell->json));
-            } else {
-                json_array_add(row, json_null_create());
-            }
+            json_array_add(row, cell_to_json(table_cell__(table, y, x)));
         }
         json_array_add(data, row);
     }

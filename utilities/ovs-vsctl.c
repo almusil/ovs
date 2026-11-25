@@ -168,8 +168,9 @@ main(int argc, char *argv[])
     char *args = process_escape_args(argv);
     shash_init(&local_options);
     parse_options(argc, argv, &local_options);
-    char *error = ctl_parse_commands(argc - optind, argv + optind,
-                                     &local_options, &commands, &n_commands);
+    char *error = ctl_parse_commands_with_style(argc - optind, argv + optind,
+                                               &local_options, &table_style,
+                                               &commands, &n_commands);
     if (error) {
         ctl_fatal("%s", error);
     }

@@ -1025,6 +1025,72 @@ cmd_get(struct ctl_context *ctx)
     }
 }
 
+/* The root row is at depth zero. */
+#define LIST_REF_MAX_DEPTH 5
+
+/* Returns the exact schema target of a UUID reference, if there is one. */
+static const struct ovsdb_idl_table_class *
+list_ref_table(const struct ovsdb_base_type *base)
+{
+    if (ovsdb_base_type_is_ref(base)) {
+        for (size_t i = 0; i < n_classes; i++) {
+            if (!strcmp(base->uuid.refTableName, idl_classes[i].name)) {
+                return &idl_classes[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Monitors referenced rows' columns starting from a column at 'depth'. */
+static void
+pre_list_refs(struct ovsdb_idl *idl, const struct ovsdb_type *type,
+              unsigned int depth, unsigned int *depths)
+{
+    if (depth == LIST_REF_MAX_DEPTH) {
+        return;
+    }
+    depth++;
+
+    const struct ovsdb_idl_table_class *targets[] = {
+        list_ref_table(&type->key),
+        list_ref_table(&type->value),
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(targets); i++) {
+        const struct ovsdb_idl_table_class *table = targets[i];
+        if (!table) {
+            continue;
+        }
+
+        /* Only full-table visits count.  A shallower visit can reach more
+         * descendants, even if all columns of this table are monitored. */
+        size_t index = table - idl_classes;
+        if (depths[index] && depths[index] <= depth) {
+            continue;
+        }
+        depths[index] = depth;
+        ovsdb_idl_add_table(idl, table);
+        for (size_t j = 0; j < table->n_columns; j++) {
+            const struct ovsdb_idl_column *column = &table->columns[j];
+            ovsdb_idl_add_column(idl, column);
+            pre_list_refs(idl, &column->type, depth, depths);
+        }
+    }
+}
+
+/* Includes the synthetic _uuid column, represented by NULL, first. */
+static const struct ovsdb_idl_column **
+list_all_columns(const struct ovsdb_idl_table_class *table)
+{
+    const struct ovsdb_idl_column **columns =
+        xmalloc((table->n_columns + 1) * sizeof *columns);
+    columns[0] = NULL;
+    for (size_t i = 0; i < table->n_columns; i++) {
+        columns[i + 1] = &table->columns[i];
+    }
+    return columns;
+}
+
 /* Returns NULL on success or malloc()'ed error message on failure. */
 static char * OVS_WARN_UNUSED_RESULT
 parse_column_names(const char *column_names,
@@ -1036,14 +1102,8 @@ parse_column_names(const char *column_names,
     size_t n_columns;
 
     if (!column_names) {
-        size_t i;
-
         n_columns = table->n_columns + 1;
-        columns = xmalloc(n_columns * sizeof *columns);
-        columns[0] = NULL;
-        for (i = 0; i < table->n_columns; i++) {
-            columns[i + 1] = &table->columns[i];
-        }
+        columns = list_all_columns(table);
     } else {
         char *s = xstrdup(column_names);
         size_t allocated_columns;
@@ -1097,11 +1157,17 @@ pre_list_columns(struct ctl_context *ctx,
     if (error) {
         return error;
     }
+    unsigned int *depths = shash_find(&ctx->options, "--all")
+                           ? xzalloc(n_classes * sizeof *depths) : NULL;
     for (i = 0; i < n_columns; i++) {
         if (columns[i]) {
             ovsdb_idl_add_column(ctx->idl, columns[i]);
+            if (depths) {
+                pre_list_refs(ctx->idl, &columns[i]->type, 0, depths);
+            }
         }
     }
+    free(depths);
     free(columns);
     return NULL;
 }
@@ -1142,15 +1208,82 @@ list_make_table(const struct ovsdb_idl_column **columns, size_t n_columns)
     return out;
 }
 
+/* Tracks only the active ancestors of the row being rendered. */
+struct list_ref_path {
+    const struct ovsdb_idl *idl; /* The current IDL transaction view. */
+
+    /* Only slots through the current depth belong to the active path. */
+    const struct ovsdb_idl_row *rows[LIST_REF_MAX_DEPTH + 1];
+};
+
+/* Returns whether 'row' is on the current branch, including 'depth'. */
+static bool
+list_ref_on_path(const struct list_ref_path *path,
+                 const struct ovsdb_idl_row *row, unsigned int depth)
+{
+    for (unsigned int i = 0; i <= depth; i++) {
+        if (path->rows[i] == row) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void list_record(const struct ovsdb_idl_row *,
+                        const struct ovsdb_idl_column **, size_t n_columns,
+                        struct table *, struct list_ref_path *,
+                        unsigned int depth);
+
+/* Resolves schema references in a cell without modifying its source datum. */
+static void
+list_cell_refs(struct cell *cell, const struct ovsdb_datum *datum,
+               struct list_ref_path *path, unsigned int depth)
+{
+    const struct ovsdb_idl_table_class *targets[] = {
+        list_ref_table(&cell->type->key),
+        list_ref_table(&cell->type->value),
+    };
+    if (!targets[0] && !targets[1]) {
+        return;
+    }
+    const union ovsdb_atom *atoms[] = { datum->keys, datum->values };
+
+    for (unsigned int i = 0; i < datum->n; i++) {
+        for (size_t side = 0; side < ARRAY_SIZE(targets); side++) {
+            const struct ovsdb_idl_table_class *table = targets[side];
+            if (!table) {
+                continue;
+            }
+            const struct uuid *uuid = &atoms[side][i].uuid;
+            const struct ovsdb_idl_row *row =
+                ovsdb_idl_get_row_for_uuid(path->idl, table, uuid);
+            if (!row || list_ref_on_path(path, row, depth)) {
+                continue;
+            }
+
+            const struct ovsdb_idl_column **columns = list_all_columns(table);
+            size_t n_columns = table->n_columns + 1;
+            struct table *child = list_make_table(columns, n_columns);
+            list_record(row, columns, n_columns, child, path, depth + 1);
+            free(columns);
+            table_cell_add_ref(cell, i, side == 1, table->name, child);
+        }
+    }
+}
+
+/* Collects a row's typed cells and, if 'path' is provided, expanded refs. */
 static void
 list_record(const struct ovsdb_idl_row *row,
             const struct ovsdb_idl_column **columns, size_t n_columns,
-            struct table *out)
+            struct table *out, struct list_ref_path *path, unsigned int depth)
 {
     size_t i;
 
     if (!row) {
         return;
+    }
+    if (path) {
+        path->rows[depth] = row;
     }
 
     table_add_row(out);
@@ -1175,6 +1308,9 @@ list_record(const struct ovsdb_idl_row *row,
 
             cell->json = ovsdb_datum_to_json(datum, &column->type);
             cell->type = &column->type;
+            if (path && depth < LIST_REF_MAX_DEPTH) {
+                list_cell_refs(cell, datum, path, depth);
+            }
         }
     }
 }
@@ -1183,6 +1319,9 @@ static void
 cmd_list(struct ctl_context *ctx)
 {
     const char *column_names = shash_find_data(&ctx->options, "--columns");
+    struct list_ref_path path = { .idl = ctx->idl };
+    struct list_ref_path *refs =
+        shash_find(&ctx->options, "--all") ? &path : NULL;
     bool must_exist = !shash_find(&ctx->options, "--if-exists");
     const struct ovsdb_idl_column **columns;
     const char *table_name = ctx->argv[1];
@@ -1210,14 +1349,14 @@ cmd_list(struct ctl_context *ctx)
                 free(columns);
                 return;
             }
-            list_record(row, columns, n_columns, out);
+            list_record(row, columns, n_columns, out, refs, 0);
         }
     } else {
         const struct ovsdb_idl_row *row;
 
         for (row = ovsdb_idl_first_row(ctx->idl, table); row != NULL;
              row = ovsdb_idl_next_row(row)) {
-            list_record(row, columns, n_columns, out);
+            list_record(row, columns, n_columns, out, refs, 0);
         }
     }
     free(columns);
@@ -1289,6 +1428,9 @@ static void
 cmd_find(struct ctl_context *ctx)
 {
     const char *column_names = shash_find_data(&ctx->options, "--columns");
+    struct list_ref_path path = { .idl = ctx->idl };
+    struct list_ref_path *refs =
+        shash_find(&ctx->options, "--all") ? &path : NULL;
     const struct ovsdb_idl_column **columns;
     const char *table_name = ctx->argv[1];
     const struct ovsdb_idl_table_class *table;
@@ -1322,7 +1464,7 @@ cmd_find(struct ctl_context *ctx)
                 goto next_row;
             }
         }
-        list_record(row, columns, n_columns, out);
+        list_record(row, columns, n_columns, out, refs, 0);
 
     next_row: ;
     }
@@ -1951,6 +2093,7 @@ cmd_wait_until(struct ctl_context *ctx)
 /* Parses one command. */
 static char * OVS_WARN_UNUSED_RESULT
 parse_command(int argc, char *argv[], struct shash *local_options,
+              const struct table_style *style,
               struct ctl_command *command)
 {
     const struct ctl_command_syntax *p;
@@ -2042,6 +2185,26 @@ parse_command(int argc, char *argv[], struct shash *local_options,
         error = xasprintf("'%s' command takes at most %d arguments",
                           p->name, p->max_args);
         goto error;
+    }
+
+    if ((p->run == cmd_list || p->run == cmd_find)
+        && shash_find(&command->options, "--all")) {
+        if (!style) {
+            error = xasprintf("'%s' with '--all' is not supported by "
+                              "this client", p->name);
+            goto error;
+        }
+        if (style->cell_format == CF_BARE) {
+            error = xasprintf("'%s' with '--all' does not support bare data",
+                              p->name);
+            goto error;
+        }
+        if (style->format != TF_LIST && style->format != TF_TABLE
+            && style->format != TF_JSON) {
+            error = xasprintf("'%s' with '--all' requires list, table, or "
+                              "JSON output", p->name);
+            goto error;
+        }
     }
 
     command->syntax = p;
@@ -2437,10 +2600,14 @@ ctl_add_cmd_options(struct option **options_p, size_t *n_options_p,
     memset(o, 0, sizeof *o);
 }
 
-/* Parses command-line input for commands. */
+/* Parses a command batch, checking the output style of list/find --all before
+ * any commands can be run. */
 char *
-ctl_parse_commands(int argc, char *argv[], struct shash *local_options,
-                   struct ctl_command **commandsp, size_t *n_commandsp)
+ctl_parse_commands_with_style(int argc, char *argv[],
+                              struct shash *local_options,
+                              const struct table_style *style,
+                              struct ctl_command **commandsp,
+                              size_t *n_commandsp)
 {
     struct ctl_command *commands;
     size_t n_commands, allocated_commands;
@@ -2466,7 +2633,7 @@ ctl_parse_commands(int argc, char *argv[], struct shash *local_options,
                     }
                 }
                 error = parse_command(i - start, &argv[start], local_options,
-                                      &commands[n_commands]);
+                                      style, &commands[n_commands]);
                 if (error) {
                     struct ctl_command *c;
 
@@ -2491,6 +2658,15 @@ ctl_parse_commands(int argc, char *argv[], struct shash *local_options,
     *commandsp = commands;
     *n_commandsp = n_commands;
     return NULL;
+}
+
+/* Clients without an output style cannot use list/find --all. */
+char *
+ctl_parse_commands(int argc, char *argv[], struct shash *local_options,
+                   struct ctl_command **commandsp, size_t *n_commandsp)
+{
+    return ctl_parse_commands_with_style(argc, argv, local_options, NULL,
+                                         commandsp, n_commandsp);
 }
 
 /* Prints all registered commands. */
@@ -2618,9 +2794,9 @@ static const struct ctl_command_syntax db_ctl_commands[] = {
     {"get", 2, INT_MAX, "TABLE RECORD [COLUMN[:KEY]]...",pre_cmd_get, cmd_get,
      NULL, "--if-exists,--id=", RO},
     {"list", 1, INT_MAX, "TABLE [RECORD]...", pre_cmd_list, cmd_list, NULL,
-     "--if-exists,--columns=", RO},
+     "--if-exists,--columns=,--all", RO},
     {"find", 1, INT_MAX, "TABLE [COLUMN[:KEY]=VALUE]...", pre_cmd_find,
-     cmd_find, NULL, "--columns=", RO},
+     cmd_find, NULL, "--columns=,--all", RO},
     {"set", 3, INT_MAX, "TABLE RECORD COLUMN[:KEY]=VALUE...", pre_cmd_set,
      cmd_set, NULL, "--if-exists", RW},
     {"add", 4, INT_MAX, "TABLE RECORD COLUMN [KEY=]VALUE...", pre_cmd_add,

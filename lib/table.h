@@ -22,6 +22,7 @@
 #include "compiler.h"
 #include "openvswitch/json.h"
 
+struct cell_refs;
 struct ds;
 struct table_style;
 
@@ -55,9 +56,13 @@ struct cell {
     /* JSON. */
     struct json *json;
     const struct ovsdb_type *type;
+
+    struct cell_refs *refs;     /* Owned expansions of the typed datum. */
 };
 
 struct cell *table_add_cell(struct table *);
+void table_cell_add_ref(struct cell *, unsigned int index, bool is_value,
+                        const char *table_name, struct table *row);
 
 /* Table formatting. */
 
